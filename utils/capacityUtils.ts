@@ -2,6 +2,7 @@ import { Order, ProductionCapacity } from '../types';
 
 export const getSectorProducedQty = (order: Order, sectorId: string): number => {
   switch (sectorId) {
+    // Tecelagem e Felpo Cru partilham o mesmo campo de quantidade (felpoCruQty).
     case 'tecelagem': return order.felpoCruQty || 0;
     case 'felpo_cru': return order.felpoCruQty || 0;
     case 'tinturaria': return order.tinturariaQty || 0;
