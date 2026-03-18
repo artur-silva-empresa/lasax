@@ -578,8 +578,10 @@ const App: React.FC = () => {
                 </button>
             </div>
         );
+      // BUG 7 CORRIGIDO: o case 'default' omitia a prop onNavigateToOrders,
+      // o que causaria erro em runtime se o Dashboard tentasse navegar para as encomendas.
       default:
-        return <Dashboard orders={orders} />;
+        return <Dashboard orders={orders} onNavigateToOrders={handleNavigateToOrders} />;
     }
   };
 
@@ -597,31 +599,83 @@ const App: React.FC = () => {
     return lateCount + pendingCount;
   }, [orders]);
 
+  // Estado para o aviso de base de dados existente no login
+  const [pendingLoginUser, setPendingLoginUser] = React.useState<User | null>(null);
+
   // Se não estiver logado, mostra apenas o Login
   if (!currentUser) {
+    const doLogin = (user: User) => {
+      // Determinar vista inicial baseada em permissões
+      let initialView = user.role === 'admin' ? 'dashboard' : 'orders';
+      const perms: any = user.permissions;
+      if (perms[initialView] === 'none') {
+        initialView = getFirstAvailableView(user);
+      }
+      setCurrentUser(user);
+      setActiveView(initialView);
+    };
+
     return (
-      <Login onLogin={async (user) => {
-        // Reset da base de dados ao fazer login
-        try {
-          await clearOrdersFromDB();
-        } catch (e) {
-          console.error("Erro ao limpar BD no login:", e);
-        }
-        setOrders([]);
-        setExcelHeaders({});
-        setCurrentUser(user);
+      <>
+        <Login onLogin={async (user) => {
+          // Se existirem dados carregados, pedir confirmação antes de continuar.
+          if (orders.length > 0) {
+            setPendingLoginUser(user);
+          } else {
+            doLogin(user);
+          }
+        }} />
 
-        // Determinar vista inicial baseada em permissões
-        let initialView = user.role === 'admin' ? 'dashboard' : 'orders';
-
-        // Validar se tem permissão para a vista inicial
-        const perms: any = user.permissions;
-        if (perms[initialView] === 'none') {
-            initialView = getFirstAvailableView(user);
-        }
-
-        setActiveView(initialView);
-      }} />
+        {/* Modal de aviso: existe base de dados carregada */}
+        {pendingLoginUser && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
+            <div className="bg-white dark:bg-slate-900 rounded-2xl shadow-2xl max-w-md w-full p-6 animate-in zoom-in-95 duration-200">
+              <div className="flex items-start gap-4 mb-5">
+                <div className="bg-amber-100 dark:bg-amber-900/30 p-2.5 rounded-xl text-amber-600 dark:text-amber-400 shrink-0">
+                  <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+                </div>
+                <div>
+                  <h3 className="font-black text-slate-800 dark:text-white text-base mb-1">Base de dados existente</h3>
+                  <p className="text-sm text-slate-500 dark:text-slate-400 leading-relaxed">
+                    Existem <span className="font-bold text-slate-700 dark:text-slate-200">{orders.length} registos</span> carregados. Deseja apagar estes dados antes de continuar com o login?
+                  </p>
+                </div>
+              </div>
+              <div className="flex flex-col gap-2">
+                <button
+                  onClick={async () => {
+                    await clearOrdersFromDB();
+                    setOrders([]);
+                    setExcelHeaders({});
+                    const u = pendingLoginUser;
+                    setPendingLoginUser(null);
+                    doLogin(u);
+                  }}
+                  className="w-full bg-rose-600 hover:bg-rose-700 text-white font-bold py-3 rounded-xl transition-colors text-sm"
+                >
+                  Apagar dados e entrar
+                </button>
+                <button
+                  onClick={() => {
+                    const u = pendingLoginUser;
+                    setPendingLoginUser(null);
+                    doLogin(u);
+                  }}
+                  className="w-full bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 font-bold py-3 rounded-xl transition-colors text-sm"
+                >
+                  Manter dados e entrar
+                </button>
+                <button
+                  onClick={() => setPendingLoginUser(null)}
+                  className="w-full text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 font-medium py-2 text-sm transition-colors"
+                >
+                  Cancelar
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </>
     );
   }
 
