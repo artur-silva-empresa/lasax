@@ -53,11 +53,32 @@ const initDB = (): Promise<IDBDatabase> => {
 // --- DATA PERSISTENCE HELPERS ---
 
 export const hashPassword = async (password: string): Promise<string> => {
-    // Fallback for non-secure contexts where crypto.subtle is undefined
+    // Fallback para contextos não-HTTPS onde crypto.subtle não está disponível.
     if (!window.crypto || !window.crypto.subtle) {
-        console.warn("Crypto Subtle não disponível. A usar fallback inseguro (apenas para desenvolvimento/contextos HTTP).");
-        // Fallback extremamente simples (NÃO SEGURO para produção, mas evita crash)
-        return Array.from(password).reduce((acc, char) => acc + char.charCodeAt(0).toString(16), "");
+        console.warn("Crypto Subtle não disponível. A usar fallback com salt (apenas para desenvolvimento/HTTP).");
+        // BUG 9 CORRIGIDO: fallback anterior era trivialmente reversível (soma de charCodes).
+        // Este fallback adiciona um salt fixo e faz múltiplas iterações para dificultar
+        // ataques de dicionário. NÃO É SEGURO para produção — usar sempre HTTPS.
+        const SALT = 'TexFlow_Lasa_2024_@#$';
+        const salted = SALT + password + SALT;
+        let hash = 0;
+        for (let i = 0; i < salted.length; i++) {
+            const chr = salted.charCodeAt(i);
+            hash = ((hash << 5) - hash) + chr;
+            hash |= 0; // Converter para inteiro 32-bit
+        }
+        // Múltiplas iterações para aumentar custo computacional
+        let result = Math.abs(hash).toString(16).padStart(8, '0');
+        for (let iter = 0; iter < 1000; iter++) {
+            let h = 0;
+            const s = result + salted;
+            for (let i = 0; i < s.length; i++) {
+                h = ((h << 5) - h) + s.charCodeAt(i);
+                h |= 0;
+            }
+            result = Math.abs(h).toString(16).padStart(8, '0');
+        }
+        return result;
     }
     const msgUint8 = new TextEncoder().encode(password);
     const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
@@ -132,6 +153,7 @@ export const initializeDefaultUsers = async () => {
             id: '2',
             username: 'Lasa',
             name: 'Utilizador Lasa',
+            // Password vazia intencional para o utilizador de leitura Lasa.
             passwordHash: await hashPassword(''),
             role: 'viewer',
             permissions: viewerPerms
@@ -184,17 +206,35 @@ export const loadOrdersFromDB = async (): Promise<{orders: Order[], headers: Rec
         
         tx.oncomplete = () => {
             if (reqOrders.result) {
-                const hydratedOrders = (reqOrders.result as any[]).map(o => ({
-                    ...o,
-                    issueDate: o.issueDate ? new Date(o.issueDate) : null,
-                    requestedDate: o.requestedDate ? new Date(o.requestedDate) : null,
-                    dataTec: o.dataTec ? new Date(o.dataTec) : null,
-                    felpoCruDate: o.felpoCruDate ? new Date(o.felpoCruDate) : null,
-                    tinturariaDate: o.tinturariaDate ? new Date(o.tinturariaDate) : null,
-                    confDate: o.confDate ? new Date(o.confDate) : null,
-                    armExpDate: o.armExpDate ? new Date(o.armExpDate) : null,
-                    dataEnt: o.dataEnt ? new Date(o.dataEnt) : null,
-                }));
+                const hydratedOrders = (reqOrders.result as any[]).map(o => {
+                    // BUG 5 CORRIGIDO: hidratação completa de todos os campos Date.
+                    // Antes, dataEspecial, dataPrinter, dataDebuxo, dataAmostras, dataBordados,
+                    // archivedAt e as datas dentro de sectorPredictedDates ficavam como strings.
+                    const hydratedPredictedDates: Record<string, Date | null> = {};
+                    if (o.sectorPredictedDates && typeof o.sectorPredictedDates === 'object') {
+                        Object.entries(o.sectorPredictedDates).forEach(([k, v]) => {
+                            hydratedPredictedDates[k] = v ? new Date(v as string) : null;
+                        });
+                    }
+                    return {
+                        ...o,
+                        issueDate:       o.issueDate       ? new Date(o.issueDate)       : null,
+                        requestedDate:   o.requestedDate   ? new Date(o.requestedDate)   : null,
+                        dataTec:         o.dataTec         ? new Date(o.dataTec)         : null,
+                        felpoCruDate:    o.felpoCruDate    ? new Date(o.felpoCruDate)    : null,
+                        tinturariaDate:  o.tinturariaDate  ? new Date(o.tinturariaDate)  : null,
+                        confDate:        o.confDate        ? new Date(o.confDate)        : null,
+                        armExpDate:      o.armExpDate      ? new Date(o.armExpDate)      : null,
+                        dataEnt:         o.dataEnt         ? new Date(o.dataEnt)         : null,
+                        dataEspecial:    o.dataEspecial    ? new Date(o.dataEspecial)    : null,
+                        dataPrinter:     o.dataPrinter     ? new Date(o.dataPrinter)     : null,
+                        dataDebuxo:      o.dataDebuxo      ? new Date(o.dataDebuxo)      : null,
+                        dataAmostras:    o.dataAmostras    ? new Date(o.dataAmostras)    : null,
+                        dataBordados:    o.dataBordados    ? new Date(o.dataBordados)    : null,
+                        archivedAt:      o.archivedAt      ? new Date(o.archivedAt)      : null,
+                        sectorPredictedDates: hydratedPredictedDates,
+                    };
+                });
                 resolve({ orders: hydratedOrders, headers: reqHeaders.result || {} });
             } else {
                 resolve(null);
@@ -335,6 +375,7 @@ export const getOrderState = (order: Order): OrderState => {
 export const getSectorState = (order: Order, sectorId: string): SectorState => {
   let qty = 0;
   switch (sectorId) {
+    // Tecelagem e Felpo Cru partilham o mesmo campo de quantidade (felpoCruQty).
     case 'tecelagem': qty = order.felpoCruQty; break;
     case 'felpo_cru': qty = order.felpoCruQty; break;
     case 'tinturaria': qty = order.tinturariaQty; break;
@@ -441,13 +482,23 @@ export const parseExcelFile = async (file: File): Promise<{ orders: Order[], hea
             const docNr = String(row['B']).trim();
             const itemNr = parseNumber(row['F']);
 
+            // Layout de colunas apos remocao do campo 'size' do ERP (era coluna L).
+            // Todas as colunas a partir de L deslocaram-se uma posicao para a esquerda.
+            // A=clientCode  B=docNr      C=clientName   D=issueDate     E=requestedDate
+            // F=itemNr      G=po         H=articleCode  I=reference     J=colorCode
+            // K=colorDesc   L=family     M=sizeDesc     N=ean           O=qtyRequested
+            // P=dataTec     Q=felpoCruQty R=felpoCruDate S=tinturariaQty T=tinturariaDate
+            // U=confRoupoesQty V=confFelposQty W=confDate X=embAcabQty   Y=armExpDate
+            // Z=stockCxQty  AA=qtyBilled  AB=qtyOpen    AC=comercial
+
             const order: Order = {
-                _raw: row, 
+                _raw: row,
+                // Todos os registos tem itemNr valido - ID composto sem fallback.
                 id: `${docNr}-${itemNr}`,
                 docNr: docNr,
-                clientCode: '',
+                clientCode: String(row['A'] || '').trim(),
                 clientName: String(row['C'] || '').trim(),
-                comercial: String(row['L'] || '').trim(),
+                comercial: String(row['AC'] || '').trim(),
                 issueDate: parseExcelDate(row['D']),
                 requestedDate: parseExcelDate(row['E']),
                 itemNr: itemNr,
@@ -456,25 +507,27 @@ export const parseExcelFile = async (file: File): Promise<{ orders: Order[], hea
                 reference: String(row['I'] || '').trim(),
                 colorCode: String(row['J'] || '').trim(),
                 colorDesc: String(row['K'] || '').trim(),
-                size: String(row['L'] || '').trim(),
-                family: String(row['M'] || '').trim(),
-                sizeDesc: String(row['N'] || '').trim(),
-                ean: String(row['O'] || '').trim(),
-                qtyRequested: parseNumber(row['P']),
-                dataTec: parseExcelDate(row['Q']),
-                felpoCruQty: parseNumber(row['R']),
-                felpoCruDate: parseExcelDate(row['S']),
-                tinturariaQty: parseNumber(row['T']),
-                tinturariaDate: parseExcelDate(row['U']),
-                confRoupoesQty: parseNumber(row['V']),
-                confFelposQty: parseNumber(row['W']),
-                confDate: parseExcelDate(row['X']),
-                embAcabQty: parseNumber(row['Y']),
-                armExpDate: parseExcelDate(row['Z']),
-                stockCxQty: parseNumber(row['AA']),
-                qtyBilled: parseNumber(row['AB']),
-                qtyOpen: parseNumber(row['AC']),
-                dataEnt: parseExcelDate(row['E']),
+                // 'size' eliminado do ERP - campo fica vazio para compatibilidade com o tipo Order.
+                size: '',
+                family: String(row['L'] || '').trim(),
+                sizeDesc: String(row['M'] || '').trim(),
+                ean: String(row['N'] || '').trim(),
+                qtyRequested: parseNumber(row['O']),
+                dataTec: parseExcelDate(row['P']),
+                felpoCruQty: parseNumber(row['Q']),
+                felpoCruDate: parseExcelDate(row['R']),
+                tinturariaQty: parseNumber(row['S']),
+                tinturariaDate: parseExcelDate(row['T']),
+                confRoupoesQty: parseNumber(row['U']),
+                confFelposQty: parseNumber(row['V']),
+                confDate: parseExcelDate(row['W']),
+                embAcabQty: parseNumber(row['X']),
+                armExpDate: parseExcelDate(row['Y']),
+                stockCxQty: parseNumber(row['Z']),
+                qtyBilled: parseNumber(row['AA']),
+                qtyOpen: parseNumber(row['AB']),
+                // Apenas requestedDate e considerada para entregas. dataEnt nao e exportado pelo ERP.
+                dataEnt: null,
                 dataEspecial: null, dataPrinter: null, dataDebuxo: null, dataAmostras: null, dataBordados: null,
                 sectorObservations: {},
                 priority: 0,
