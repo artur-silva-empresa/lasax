@@ -49,8 +49,9 @@ export interface Sector {
 
 export interface Order {
   id:string;
+  docSeries: string;   // Série do documento (coluna A do ERP, ex: "525")
   docNr: string;
-  clientCode: string;
+  clientCode: string;  // Código de cliente (não exportado pelo ERP; preenchido manualmente ou por outras fontes)
   clientName: string;
   comercial: string;
   issueDate: Date | null;
