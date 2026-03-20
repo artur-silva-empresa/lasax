@@ -460,8 +460,8 @@ export const calculateKPIs = (orders: Order[]): DashboardKPIs => {
 // Suporta dois formatos de forma automática:
 //
 // FORMATO ERP (cabeçalhos em português, ex: "Nr.Documento", "Data Pedida"):
-//   Leitura POSICIONAL — obrigatória porque "Descricao" aparece em duas
-//   colunas distintas (K=cor, N=tamanho), tornando o lookup por nome ambíguo.
+//   Leitura por LETRA DE COLUNA DIRECTA — sem depender de ordenação de Object.keys().
+//   O ficheiro ERP tem 35 colunas (A a AI):
 //
 //   A=clientCode(Série)  B=docNr        C=clientName    D=issueDate      E=requestedDate
 //   F=itemNr             G=po           H=articleCode   I=reference      J=colorCode
@@ -471,64 +471,10 @@ export const calculateKPIs = (orders: Order[]): DashboardKPIs => {
 //   Z=armExpDate         AA=stockCxQty  AB=dataEnt      AC=dataEspecial  AD=dataPrinter
 //   AE=dataDebuxo        AF=dataAmostras AG=dataBordados AH=qtyBilled    AI=qtyOpen
 //
-// FORMATO APP (cabeçalhos = nomes internos, ex: "docNr", "requestedDate"):
-//   Detetado pela presença de "docNr" como valor da linha de cabeçalho.
-//   Leitura por NOME — campos ERP em primeiro lugar (mesma ordem), seguidos
-//   dos campos exclusivos da app:
-//   AJ=priority  AK=isManual  AL=sectorObservations  AM=sectorPredictedDates
-//   AN=sectorStopReasons  AO=isArchived  AP=archivedAt  AQ=archivedBy
+// FORMATO APP (cabeçalhos = nomes internos, ex: "docNr", "qtyRequested"):
+//   Detetado pela presença de "docNr" E/OU "qtyBilled" como valores de cabeçalho.
+//   Leitura por NOME DE CAMPO via mapa invertido cabeçalho→letra.
 //
-// Mapeamento posicional ERP (índice 0-based → nome interno):
-const ERP_COLUMNS: string[] = [
-  'clientCode',     // 0  A  Série
-  'docNr',          // 1  B  Nr.Documento
-  'clientName',     // 2  C  Cliente
-  'issueDate',      // 3  D  Data Emissão
-  'requestedDate',  // 4  E  Data Pedida
-  'itemNr',         // 5  F  Item
-  'po',             // 6  G  PO
-  'articleCode',    // 7  H  Cod.Artigo
-  'reference',      // 8  I  Referencia
-  'colorCode',      // 9  J  Cor
-  'colorDesc',      // 10 K  Descricao (descrição da cor)
-  'comercial',      // 11 L  Comercial
-  'family',         // 12 M  Familia
-  'sizeDesc',       // 13 N  Descricao (tamanho/modelo)
-  'ean',            // 14 O  EAN
-  'qtyRequested',   // 15 P  Qtd Pedida
-  'dataTec',        // 16 Q  Data Tec.
-  'felpoCruQty',    // 17 R  Felpo Cru
-  'felpoCruDate',   // 18 S  Data F.Cru
-  'tinturariaQty',  // 19 T  Tinturaria
-  'tinturariaDate', // 20 U  Data Tint.
-  'confRoupoesQty', // 21 V  Confeccao Roupoes
-  'confFelposQty',  // 22 W  Confeccao Felpos
-  'confDate',       // 23 X  Data Conf.
-  'embAcabQty',     // 24 Y  Emb./Acab.
-  'armExpDate',     // 25 Z  Data Arm. Exp.
-  'stockCxQty',     // 26 AA Stock Cx.
-  'dataEnt',        // 27 AB Data Ent.
-  'dataEspecial',   // 28 AC Data Especial.
-  'dataPrinter',    // 29 AD Data Printer.
-  'dataDebuxo',     // 30 AE Data Debuxo.
-  'dataAmostras',   // 31 AF Data Amostras.
-  'dataBordados',   // 32 AG Data Bordados.
-  'qtyBilled',      // 33 AH Facturada
-  'qtyOpen',        // 34 AI Em Aberto
-];
-
-// Campos exclusivos da app (não existem no ERP):
-const APP_ONLY_COLUMNS: string[] = [
-  'priority',             // AJ
-  'isManual',             // AK
-  'sectorObservations',   // AL
-  'sectorPredictedDates', // AM
-  'sectorStopReasons',    // AN
-  'isArchived',           // AO
-  'archivedAt',           // AP
-  'archivedBy',           // AQ
-];
-
 export const parseExcelFile = async (file: File): Promise<{ orders: Order[], headers: Record<string, string> }> => {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -553,32 +499,22 @@ export const parseExcelFile = async (file: File): Promise<{ orders: Order[], hea
         });
 
         // Deteção de formato: o export da app usa nomes internos como cabeçalhos.
-        // "docNr" nunca aparece como cabeçalho ERP (que usa "Nr.Documento").
-        // "qtyBilled" também nunca aparece no ERP (que usa "Facturada").
-        // Verificar ambos para maior robustez.
+        // "docNr" e "qtyBilled" nunca aparecem como cabeçalhos ERP.
         const headerValues = Object.values(extractedHeaders).map(v => v.trim());
         const isAppExport = headerValues.includes('docNr') || headerValues.includes('qtyBilled');
 
-        // Construir mapa fieldName → colLetter
+        // Para formato app: construir mapa fieldName → colLetter a partir dos cabeçalhos
         const fieldToCol: Record<string, string> = {};
-        const colLetters = Object.keys(headerRow);
-
         if (isAppExport) {
-            // Formato app: valores do cabeçalho são os nomes internos
             Object.entries(extractedHeaders).forEach(([letter, name]) => {
                 const trimmed = name.trim();
                 if (trimmed) fieldToCol[trimmed] = letter;
             });
-        } else {
-            // Formato ERP: mapeamento posicional
-            colLetters.forEach((letter, idx) => {
-                if (idx < ERP_COLUMNS.length) {
-                    fieldToCol[ERP_COLUMNS[idx]] = letter;
-                }
-            });
         }
 
-        const get = (row: any, fieldName: string): any => {
+        // get() para formato app: lookup por nome
+        // get() para formato ERP: acesso directo à letra de coluna
+        const getApp = (row: any, fieldName: string): any => {
             const col = fieldToCol[fieldName];
             return col !== undefined ? row[col] : undefined;
         };
@@ -597,83 +533,135 @@ export const parseExcelFile = async (file: File): Promise<{ orders: Order[], hea
         for (let i = 0; i < jsonData.length; i++) {
             const row: any = jsonData[i];
 
-            const rawDocNr = get(row, 'docNr');
+            // Obter docNr consoante o formato
+            const rawDocNr = isAppExport ? getApp(row, 'docNr') : row['B'];
             if (!rawDocNr || String(rawDocNr).toLowerCase().includes('nr.doc') || String(rawDocNr).trim() === '') continue;
 
             const docNr  = String(rawDocNr).trim();
-            const itemNr = parseNumber(get(row, 'itemNr'));
 
-            const order: Order = {
-                _raw: row,
-                // Recuperar o id original se disponível (formato app); senão reconstituir
-                id:            isAppExport
-                               ? (String(get(row, 'id') || '').trim() || `${docNr}-${itemNr}`)
-                               : `${docNr}-${itemNr}`,
-                docNr,
-                clientCode:    String(get(row, 'clientCode')    ?? '').trim(),
-                clientName:    String(get(row, 'clientName')    ?? '').trim(),
-                comercial:     String(get(row, 'comercial')     ?? '').trim(),
-                issueDate:     parseExcelDate(get(row, 'issueDate')),
-                requestedDate: parseExcelDate(get(row, 'requestedDate')),
-                itemNr,
-                po:            String(get(row, 'po')            ?? '').trim(),
-                articleCode:   String(get(row, 'articleCode')   ?? '').trim(),
-                reference:     String(get(row, 'reference')     ?? '').trim(),
-                colorCode:     String(get(row, 'colorCode')     ?? '').trim(),
-                colorDesc:     String(get(row, 'colorDesc')     ?? '').trim(),
-                size:          '',  // campo removido do ERP; mantido no tipo para compatibilidade SQLite
-                family:        String(get(row, 'family')        ?? '').trim(),
-                sizeDesc:      String(get(row, 'sizeDesc')      ?? '').trim(),
-                ean:           String(get(row, 'ean')           ?? '').trim(),
-                qtyRequested:  parseNumber(get(row, 'qtyRequested')),
-                dataTec:       parseExcelDate(get(row, 'dataTec')),
-                felpoCruQty:   parseNumber(get(row, 'felpoCruQty')),
-                felpoCruDate:  parseExcelDate(get(row, 'felpoCruDate')),
-                tinturariaQty: parseNumber(get(row, 'tinturariaQty')),
-                tinturariaDate:parseExcelDate(get(row, 'tinturariaDate')),
-                confRoupoesQty:parseNumber(get(row, 'confRoupoesQty')),
-                confFelposQty: parseNumber(get(row, 'confFelposQty')),
-                confDate:      parseExcelDate(get(row, 'confDate')),
-                embAcabQty:    parseNumber(get(row, 'embAcabQty')),
-                armExpDate:    parseExcelDate(get(row, 'armExpDate')),
-                stockCxQty:    parseNumber(get(row, 'stockCxQty')),
-                dataEnt:       parseExcelDate(get(row, 'dataEnt')),
-                qtyBilled:     parseNumber(get(row, 'qtyBilled')),
-                qtyOpen:       parseNumber(get(row, 'qtyOpen')),
-                // Datas especiais: existem no ERP (colunas AC-AG) e no formato app
-                dataEspecial:  parseExcelDate(get(row, 'dataEspecial')),
-                dataPrinter:   parseExcelDate(get(row, 'dataPrinter')),
-                dataDebuxo:    parseExcelDate(get(row, 'dataDebuxo')),
-                dataAmostras:  parseExcelDate(get(row, 'dataAmostras')),
-                dataBordados:  parseExcelDate(get(row, 'dataBordados')),
-                // Campos exclusivos da app (apenas no formato app; padrões para ERP)
-                priority:      isAppExport ? (parseNumber(get(row, 'priority')) || 0) : 0,
-                isManual:      isAppExport ? parseBool(get(row, 'isManual')) : false,
-                sectorObservations: isAppExport
-                    ? parseJsonField(get(row, 'sectorObservations'), {})
-                    : {},
-                sectorPredictedDates: isAppExport ? (() => {
-                    const raw = parseJsonField(get(row, 'sectorPredictedDates'), {});
-                    const result: Record<string, Date | null> = {};
-                    Object.entries(raw).forEach(([k, v]) => {
-                        result[k] = v ? new Date(v as string) : null;
-                    });
-                    return result;
-                })() : {},
-                sectorStopReasons: isAppExport
-                    ? parseJsonField(get(row, 'sectorStopReasons'), {})
-                    : {},
-                isArchived:  isAppExport ? parseBool(get(row, 'isArchived')) : false,
-                archivedAt:  isAppExport ? parseExcelDate(get(row, 'archivedAt')) : null,
-                archivedBy:  isAppExport ? String(get(row, 'archivedBy') ?? '').trim() || undefined : undefined,
-                // Recuperar datas previstas pendentes (avisos de atraso por sector)
-                sectorPredictedDatesPending: isAppExport ? (() => {
-                    const raw = parseJsonField(get(row, 'sectorPredictedDatesPending'), {});
-                    const result: Record<string, boolean> = {};
-                    Object.entries(raw).forEach(([k, v]) => { result[k] = Boolean(v); });
-                    return result;
-                })() : {},
-            };
+            let order: Order;
+
+            if (isAppExport) {
+                // --- FORMATO APP: leitura por nome de campo ---
+                const itemNr = parseNumber(getApp(row, 'itemNr'));
+                order = {
+                    _raw: row,
+                    id:            String(getApp(row, 'id') || '').trim() || `${docNr}-${itemNr}`,
+                    docSeries:     String(getApp(row, 'docSeries')     ?? '').trim(),
+                    docNr,
+                    clientCode:    String(getApp(row, 'clientCode')    ?? '').trim(),
+                    clientName:    String(getApp(row, 'clientName')    ?? '').trim(),
+                    comercial:     String(getApp(row, 'comercial')     ?? '').trim(),
+                    issueDate:     parseExcelDate(getApp(row, 'issueDate')),
+                    requestedDate: parseExcelDate(getApp(row, 'requestedDate')),
+                    itemNr,
+                    po:            String(getApp(row, 'po')            ?? '').trim(),
+                    articleCode:   String(getApp(row, 'articleCode')   ?? '').trim(),
+                    reference:     String(getApp(row, 'reference')     ?? '').trim(),
+                    colorCode:     String(getApp(row, 'colorCode')     ?? '').trim(),
+                    colorDesc:     String(getApp(row, 'colorDesc')     ?? '').trim(),
+                    size:          '',
+                    family:        String(getApp(row, 'family')        ?? '').trim(),
+                    sizeDesc:      String(getApp(row, 'sizeDesc')      ?? '').trim(),
+                    ean:           String(getApp(row, 'ean')           ?? '').trim(),
+                    qtyRequested:  parseNumber(getApp(row, 'qtyRequested')),
+                    dataTec:       parseExcelDate(getApp(row, 'dataTec')),
+                    felpoCruQty:   parseNumber(getApp(row, 'felpoCruQty')),
+                    felpoCruDate:  parseExcelDate(getApp(row, 'felpoCruDate')),
+                    tinturariaQty: parseNumber(getApp(row, 'tinturariaQty')),
+                    tinturariaDate:parseExcelDate(getApp(row, 'tinturariaDate')),
+                    confRoupoesQty:parseNumber(getApp(row, 'confRoupoesQty')),
+                    confFelposQty: parseNumber(getApp(row, 'confFelposQty')),
+                    confDate:      parseExcelDate(getApp(row, 'confDate')),
+                    embAcabQty:    parseNumber(getApp(row, 'embAcabQty')),
+                    armExpDate:    parseExcelDate(getApp(row, 'armExpDate')),
+                    stockCxQty:    parseNumber(getApp(row, 'stockCxQty')),
+                    dataEnt:       parseExcelDate(getApp(row, 'dataEnt')),
+                    qtyBilled:     parseNumber(getApp(row, 'qtyBilled')),
+                    qtyOpen:       parseNumber(getApp(row, 'qtyOpen')),
+                    dataEspecial:  parseExcelDate(getApp(row, 'dataEspecial')),
+                    dataPrinter:   parseExcelDate(getApp(row, 'dataPrinter')),
+                    dataDebuxo:    parseExcelDate(getApp(row, 'dataDebuxo')),
+                    dataAmostras:  parseExcelDate(getApp(row, 'dataAmostras')),
+                    dataBordados:  parseExcelDate(getApp(row, 'dataBordados')),
+                    priority:      parseNumber(getApp(row, 'priority')) || 0,
+                    isManual:      parseBool(getApp(row, 'isManual')),
+                    sectorObservations:  parseJsonField(getApp(row, 'sectorObservations'), {}),
+                    sectorPredictedDates: (() => {
+                        const raw = parseJsonField(getApp(row, 'sectorPredictedDates'), {});
+                        const result: Record<string, Date | null> = {};
+                        Object.entries(raw).forEach(([k, v]) => { result[k] = v ? new Date(v as string) : null; });
+                        return result;
+                    })(),
+                    sectorPredictedDatesPending: (() => {
+                        const raw = parseJsonField(getApp(row, 'sectorPredictedDatesPending'), {});
+                        const result: Record<string, boolean> = {};
+                        Object.entries(raw).forEach(([k, v]) => { result[k] = Boolean(v); });
+                        return result;
+                    })(),
+                    sectorStopReasons:  parseJsonField(getApp(row, 'sectorStopReasons'), {}),
+                    isArchived:  parseBool(getApp(row, 'isArchived')),
+                    archivedAt:  parseExcelDate(getApp(row, 'archivedAt')),
+                    archivedBy:  String(getApp(row, 'archivedBy') ?? '').trim() || undefined,
+                };
+            } else {
+                // --- FORMATO ERP: acesso DIRECTO por letra de coluna ---
+                // Cada campo usa explicitamente a letra da coluna real do ficheiro ERP.
+                // Sem arrays, sem índices calculados — impossível ter off-by-one.
+                const itemNr = parseNumber(row['F']);
+                order = {
+                    _raw: row,
+                    id:            `${docNr}-${itemNr}`,
+                    docSeries:     String(row['A']  ?? '').trim(),  // A  Série do documento
+                    docNr,
+                    clientCode:    '',                               // Não existe no ERP
+                    clientName:    String(row['C']  ?? '').trim(),  // C  Cliente
+                    comercial:     String(row['L']  ?? '').trim(),  // Comercial
+                    issueDate:     parseExcelDate(row['D']),         // Data Emissão
+                    requestedDate: parseExcelDate(row['E']),         // Data Pedida
+                    itemNr,                                           // F  Item
+                    po:            String(row['G']  ?? '').trim(),  // PO
+                    articleCode:   String(row['H']  ?? '').trim(),  // Cod.Artigo
+                    reference:     String(row['I']  ?? '').trim(),  // Referencia
+                    colorCode:     String(row['J']  ?? '').trim(),  // Cor
+                    colorDesc:     String(row['K']  ?? '').trim(),  // Descricao (cor)
+                    size:          '',
+                    family:        String(row['M']  ?? '').trim(),  // Familia
+                    sizeDesc:      String(row['N']  ?? '').trim(),  // Descricao (tamanho)
+                    ean:           String(row['O']  ?? '').trim(),  // EAN
+                    qtyRequested:  parseNumber(row['P']),            // Qtd Pedida
+                    dataTec:       parseExcelDate(row['Q']),         // Data Tec.
+                    felpoCruQty:   parseNumber(row['R']),            // Felpo Cru
+                    felpoCruDate:  parseExcelDate(row['S']),         // Data F.Cru
+                    tinturariaQty: parseNumber(row['T']),            // Tinturaria
+                    tinturariaDate:parseExcelDate(row['U']),         // Data Tint.
+                    confRoupoesQty:parseNumber(row['V']),            // Confeccao Roupoes
+                    confFelposQty: parseNumber(row['W']),            // Confeccao Felpos
+                    confDate:      parseExcelDate(row['X']),         // Data Conf.
+                    embAcabQty:    parseNumber(row['Y']),            // Emb./Acab.
+                    armExpDate:    parseExcelDate(row['Z']),         // Data Arm. Exp.
+                    stockCxQty:    parseNumber(row['AA']),           // Stock Cx.
+                    dataEnt:       parseExcelDate(row['AB']),        // Data Ent.
+                    dataEspecial:  parseExcelDate(row['AC']),        // Data Especial.
+                    dataPrinter:   parseExcelDate(row['AD']),        // Data Printer.
+                    dataDebuxo:    parseExcelDate(row['AE']),        // Data Debuxo.
+                    dataAmostras:  parseExcelDate(row['AF']),        // Data Amostras.
+                    dataBordados:  parseExcelDate(row['AG']),        // Data Bordados.
+                    qtyBilled:     parseNumber(row['AH']),           // Facturada
+                    qtyOpen:       parseNumber(row['AI']),           // Em Aberto
+                    // Campos exclusivos da app — inexistentes no ERP, inicializar com padrões
+                    priority:               0,
+                    isManual:               false,
+                    sectorObservations:     {},
+                    sectorPredictedDates:   {},
+                    sectorPredictedDatesPending: {},
+                    sectorStopReasons:      {},
+                    isArchived:             false,
+                    archivedAt:             null,
+                    archivedBy:             undefined,
+                };
+            }
+
             mappedOrders.push(order);
         }
         resolve({ orders: mappedOrders, headers: extractedHeaders });
@@ -759,7 +747,9 @@ export const parseSQLiteFile = async (file: File): Promise<{ orders: Order[], he
             // Valores por omissão para campos que possam estar ausentes em ficheiros antigos
             if (!obj.priority)   obj.priority  = 0;
             if (!obj.comercial)  obj.comercial  = '';
-            if (obj.size === undefined) obj.size = '';
+            if (obj.size === undefined)      obj.size      = '';
+            if (obj.docSeries === undefined) obj.docSeries = '';
+            if (obj.clientCode === undefined) obj.clientCode = '';
 
             return obj as Order;
         });
@@ -784,6 +774,7 @@ export const exportOrdersToSQLite = async (orders: Order[], headers: Record<stri
   db.run(`
     CREATE TABLE orders (
       id TEXT PRIMARY KEY,
+      docSeries TEXT,
       clientCode TEXT, docNr TEXT, clientName TEXT, issueDate INTEGER,
       requestedDate INTEGER, itemNr INTEGER, po TEXT,
       articleCode TEXT, reference TEXT, colorCode TEXT, colorDesc TEXT,
@@ -806,7 +797,7 @@ export const exportOrdersToSQLite = async (orders: Order[], headers: Record<stri
   db.run("BEGIN TRANSACTION");
   const stmt = db.prepare(`
     INSERT INTO orders VALUES (
-      ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+      ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
     )
   `);
 
@@ -814,6 +805,7 @@ export const exportOrdersToSQLite = async (orders: Order[], headers: Record<stri
       const ts = (d: Date | null | undefined) => (d && !isNaN(d.getTime())) ? d.getTime() : null;
       stmt.run([
         o.id,
+        o.docSeries || '',
         o.clientCode, o.docNr, o.clientName,
         ts(o.issueDate), ts(o.requestedDate),
         o.itemNr, o.po,
@@ -885,9 +877,9 @@ export const exportOrdersToSQLite = async (orders: Order[], headers: Record<stri
 //   Z=armExpDate   AA=stockCxQty  AB=dataEnt      AC=dataEspecial  AD=dataPrinter
 //   AE=dataDebuxo  AF=dataAmostras AG=dataBordados AH=qtyBilled   AI=qtyOpen
 //   -- campos app --
-//   AJ=id  AK=priority  AL=isManual  AM=sectorObservations  AN=sectorPredictedDates
-//   AO=sectorPredictedDatesPending  AP=sectorStopReasons
-//   AQ=isArchived  AR=archivedAt  AS=archivedBy
+//   AJ=id  AK=docSeries  AL=priority  AM=isManual  AN=sectorObservations  AO=sectorPredictedDates
+//   AP=sectorPredictedDatesPending  AQ=sectorStopReasons
+//   AR=isArchived  AS=archivedAt  AT=archivedBy
 //
 // A 1ª linha contém os nomes internos dos campos (ex: "docNr", "qtyBilled").
 // Na reimportação, a presença de "docNr" como valor de cabeçalho identifica
@@ -942,8 +934,9 @@ export const exportOrdersToExcel = (orders: Order[], headers: Record<string, str
         'dataBordados':                 ts(o.dataBordados),     // AG Data Bordados.
         'qtyBilled':                    o.qtyBilled,            // AH Facturada
         'qtyOpen':                      o.qtyOpen,              // AI Em Aberto
-        // === Campos exclusivos da app (AJ–AS) ===
+        // === Campos exclusivos da app (AJ–AT) ===
         'id':                           o.id,                                   // AJ
+        'docSeries':                    o.docSeries || '',                      // AK  Série do documento
         'priority':                     o.priority || 0,                        // AK
         'isManual':                     o.isManual ? 1 : 0,                     // AL
         'sectorObservations':           j(o.sectorObservations),                // AM
@@ -983,9 +976,10 @@ export interface ExportColumnDef {
 
 export const ALL_EXPORT_COLUMNS: ExportColumnDef[] = [
   // Identificação
-  { key: 'docNr',         label: 'Nr. Documento',       group: 'Identificação' },
-  { key: 'itemNr',        label: 'Item',                group: 'Identificação' },
-  { key: 'id',            label: 'ID Interno',           group: 'Identificação' },
+  { key: 'docSeries',      label: 'Série',               group: 'Identificação' },
+  { key: 'docNr',          label: 'Nr. Documento',       group: 'Identificação' },
+  { key: 'itemNr',         label: 'Item',                group: 'Identificação' },
+  { key: 'id',             label: 'ID Interno',          group: 'Identificação' },
   // Cliente
   { key: 'clientName',    label: 'Cliente',              group: 'Cliente' },
   { key: 'clientCode',    label: 'Cód. Cliente',         group: 'Cliente' },
@@ -1172,6 +1166,7 @@ export const loadCapacitiesFromDB = async (): Promise<any[]> => {
 export const generateMockOrders = (count: number = 20): Order[] => {
   return Array.from({ length: count }, (_, i) => ({
     id: `order-${i}`,
+    docSeries: '525',
     docNr: `ENC-2024-${1000 + i}`,
     clientCode: `C${100 + i}`,
     clientName: "CLIENTE EXEMPLO " + i,
