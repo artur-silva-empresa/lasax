@@ -456,6 +456,79 @@ export const calculateKPIs = (orders: Order[]): DashboardKPIs => {
 };
 
 // --- IMPORTAÇÃO DE EXCEL (.xlsx) ---
+//
+// Suporta dois formatos de forma automática:
+//
+// FORMATO ERP (cabeçalhos em português, ex: "Nr.Documento", "Data Pedida"):
+//   Leitura POSICIONAL — obrigatória porque "Descricao" aparece em duas
+//   colunas distintas (K=cor, N=tamanho), tornando o lookup por nome ambíguo.
+//
+//   A=clientCode(Série)  B=docNr        C=clientName    D=issueDate      E=requestedDate
+//   F=itemNr             G=po           H=articleCode   I=reference      J=colorCode
+//   K=colorDesc          L=comercial    M=family        N=sizeDesc       O=ean
+//   P=qtyRequested       Q=dataTec      R=felpoCruQty   S=felpoCruDate   T=tinturariaQty
+//   U=tinturariaDate     V=confRoupoesQty W=confFelposQty X=confDate     Y=embAcabQty
+//   Z=armExpDate         AA=stockCxQty  AB=dataEnt      AC=dataEspecial  AD=dataPrinter
+//   AE=dataDebuxo        AF=dataAmostras AG=dataBordados AH=qtyBilled    AI=qtyOpen
+//
+// FORMATO APP (cabeçalhos = nomes internos, ex: "docNr", "requestedDate"):
+//   Detetado pela presença de "docNr" como valor da linha de cabeçalho.
+//   Leitura por NOME — campos ERP em primeiro lugar (mesma ordem), seguidos
+//   dos campos exclusivos da app:
+//   AJ=priority  AK=isManual  AL=sectorObservations  AM=sectorPredictedDates
+//   AN=sectorStopReasons  AO=isArchived  AP=archivedAt  AQ=archivedBy
+//
+// Mapeamento posicional ERP (índice 0-based → nome interno):
+const ERP_COLUMNS: string[] = [
+  'clientCode',     // 0  A  Série
+  'docNr',          // 1  B  Nr.Documento
+  'clientName',     // 2  C  Cliente
+  'issueDate',      // 3  D  Data Emissão
+  'requestedDate',  // 4  E  Data Pedida
+  'itemNr',         // 5  F  Item
+  'po',             // 6  G  PO
+  'articleCode',    // 7  H  Cod.Artigo
+  'reference',      // 8  I  Referencia
+  'colorCode',      // 9  J  Cor
+  'colorDesc',      // 10 K  Descricao (descrição da cor)
+  'comercial',      // 11 L  Comercial
+  'family',         // 12 M  Familia
+  'sizeDesc',       // 13 N  Descricao (tamanho/modelo)
+  'ean',            // 14 O  EAN
+  'qtyRequested',   // 15 P  Qtd Pedida
+  'dataTec',        // 16 Q  Data Tec.
+  'felpoCruQty',    // 17 R  Felpo Cru
+  'felpoCruDate',   // 18 S  Data F.Cru
+  'tinturariaQty',  // 19 T  Tinturaria
+  'tinturariaDate', // 20 U  Data Tint.
+  'confRoupoesQty', // 21 V  Confeccao Roupoes
+  'confFelposQty',  // 22 W  Confeccao Felpos
+  'confDate',       // 23 X  Data Conf.
+  'embAcabQty',     // 24 Y  Emb./Acab.
+  'armExpDate',     // 25 Z  Data Arm. Exp.
+  'stockCxQty',     // 26 AA Stock Cx.
+  'dataEnt',        // 27 AB Data Ent.
+  'dataEspecial',   // 28 AC Data Especial.
+  'dataPrinter',    // 29 AD Data Printer.
+  'dataDebuxo',     // 30 AE Data Debuxo.
+  'dataAmostras',   // 31 AF Data Amostras.
+  'dataBordados',   // 32 AG Data Bordados.
+  'qtyBilled',      // 33 AH Facturada
+  'qtyOpen',        // 34 AI Em Aberto
+];
+
+// Campos exclusivos da app (não existem no ERP):
+const APP_ONLY_COLUMNS: string[] = [
+  'priority',             // AJ
+  'isManual',             // AK
+  'sectorObservations',   // AL
+  'sectorPredictedDates', // AM
+  'sectorStopReasons',    // AN
+  'isArchived',           // AO
+  'archivedAt',           // AP
+  'archivedBy',           // AQ
+];
+
 export const parseExcelFile = async (file: File): Promise<{ orders: Order[], headers: Record<string, string> }> => {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -463,82 +536,150 @@ export const parseExcelFile = async (file: File): Promise<{ orders: Order[], hea
       try {
         const data = e.target?.result;
         const workbook = XLSX.read(data, { type: 'array', cellDates: true });
-        const firstSheetName = workbook.SheetNames[0];
-        const worksheet = workbook.Sheets[firstSheetName];
-        
+        // Preferir folha 'Dados_BD' se existir (exportação app), senão usar a primeira
+        const sheetName = workbook.SheetNames.includes('Dados_BD')
+            ? 'Dados_BD'
+            : workbook.SheetNames[0];
+        const worksheet = workbook.Sheets[sheetName];
+
         const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 'A' });
         if (jsonData.length === 0) return resolve({ orders: [], headers: {} });
 
-        // Apanhar headers da primeira linha real se existirem, ou assumir layout fixo
-        const extractedHeaders = jsonData.shift() as Record<string, string> || {};
+        // Linha 1 = cabeçalhos
+        const headerRow = jsonData.shift() as Record<string, any>;
+        const extractedHeaders: Record<string, string> = {};
+        Object.entries(headerRow).forEach(([k, v]) => {
+            extractedHeaders[k] = String(v ?? '');
+        });
+
+        // Deteção de formato: o export da app usa nomes internos como cabeçalhos.
+        // "docNr" nunca aparece como cabeçalho ERP (que usa "Nr.Documento").
+        // "qtyBilled" também nunca aparece no ERP (que usa "Facturada").
+        // Verificar ambos para maior robustez.
+        const headerValues = Object.values(extractedHeaders).map(v => v.trim());
+        const isAppExport = headerValues.includes('docNr') || headerValues.includes('qtyBilled');
+
+        // Construir mapa fieldName → colLetter
+        const fieldToCol: Record<string, string> = {};
+        const colLetters = Object.keys(headerRow);
+
+        if (isAppExport) {
+            // Formato app: valores do cabeçalho são os nomes internos
+            Object.entries(extractedHeaders).forEach(([letter, name]) => {
+                const trimmed = name.trim();
+                if (trimmed) fieldToCol[trimmed] = letter;
+            });
+        } else {
+            // Formato ERP: mapeamento posicional
+            colLetters.forEach((letter, idx) => {
+                if (idx < ERP_COLUMNS.length) {
+                    fieldToCol[ERP_COLUMNS[idx]] = letter;
+                }
+            });
+        }
+
+        const get = (row: any, fieldName: string): any => {
+            const col = fieldToCol[fieldName];
+            return col !== undefined ? row[col] : undefined;
+        };
+
+        const parseJsonField = (val: any, fallback: any = {}) => {
+            if (!val) return fallback;
+            if (typeof val === 'object' && !Array.isArray(val)) return val;
+            try { return JSON.parse(String(val)); } catch { return fallback; }
+        };
+
+        const parseBool = (val: any): boolean =>
+            val === 1 || val === true || val === '1' || String(val).toLowerCase() === 'true';
+
         const mappedOrders: Order[] = [];
-        
+
         for (let i = 0; i < jsonData.length; i++) {
             const row: any = jsonData[i];
-            
-            // Validação mínima para ignorar linhas vazias ou cabeçalhos repetidos
-            if (!row['B'] || String(row['B']).toLowerCase().includes('doc')) continue;
-            
-            const docNr = String(row['B']).trim();
-            const itemNr = parseNumber(row['F']);
 
-            // Layout de colunas apos remocao do campo 'size' do ERP (era coluna L).
-            // Todas as colunas a partir de L deslocaram-se uma posicao para a esquerda.
-            // A=clientCode  B=docNr      C=clientName   D=issueDate     E=requestedDate
-            // F=itemNr      G=po         H=articleCode  I=reference     J=colorCode
-            // K=colorDesc   L=family     M=sizeDesc     N=ean           O=qtyRequested
-            // P=dataTec     Q=felpoCruQty R=felpoCruDate S=tinturariaQty T=tinturariaDate
-            // U=confRoupoesQty V=confFelposQty W=confDate X=embAcabQty   Y=armExpDate
-            // Z=stockCxQty  AA=qtyBilled  AB=qtyOpen    AC=comercial
+            const rawDocNr = get(row, 'docNr');
+            if (!rawDocNr || String(rawDocNr).toLowerCase().includes('nr.doc') || String(rawDocNr).trim() === '') continue;
+
+            const docNr  = String(rawDocNr).trim();
+            const itemNr = parseNumber(get(row, 'itemNr'));
 
             const order: Order = {
                 _raw: row,
-                // Todos os registos tem itemNr valido - ID composto sem fallback.
-                id: `${docNr}-${itemNr}`,
-                docNr: docNr,
-                clientCode: String(row['A'] || '').trim(),
-                clientName: String(row['C'] || '').trim(),
-                comercial: String(row['AC'] || '').trim(),
-                issueDate: parseExcelDate(row['D']),
-                requestedDate: parseExcelDate(row['E']),
-                itemNr: itemNr,
-                po: String(row['G'] || '').trim(),
-                articleCode: String(row['H'] || '').trim(),
-                reference: String(row['I'] || '').trim(),
-                colorCode: String(row['J'] || '').trim(),
-                colorDesc: String(row['K'] || '').trim(),
-                // 'size' eliminado do ERP - campo fica vazio para compatibilidade com o tipo Order.
-                size: '',
-                family: String(row['L'] || '').trim(),
-                sizeDesc: String(row['M'] || '').trim(),
-                ean: String(row['N'] || '').trim(),
-                qtyRequested: parseNumber(row['O']),
-                dataTec: parseExcelDate(row['P']),
-                felpoCruQty: parseNumber(row['Q']),
-                felpoCruDate: parseExcelDate(row['R']),
-                tinturariaQty: parseNumber(row['S']),
-                tinturariaDate: parseExcelDate(row['T']),
-                confRoupoesQty: parseNumber(row['U']),
-                confFelposQty: parseNumber(row['V']),
-                confDate: parseExcelDate(row['W']),
-                embAcabQty: parseNumber(row['X']),
-                armExpDate: parseExcelDate(row['Y']),
-                stockCxQty: parseNumber(row['Z']),
-                qtyBilled: parseNumber(row['AA']),
-                qtyOpen: parseNumber(row['AB']),
-                // Apenas requestedDate e considerada para entregas. dataEnt nao e exportado pelo ERP.
-                dataEnt: null,
-                dataEspecial: null, dataPrinter: null, dataDebuxo: null, dataAmostras: null, dataBordados: null,
-                sectorObservations: {},
-                priority: 0,
-                isManual: false
+                // Recuperar o id original se disponível (formato app); senão reconstituir
+                id:            isAppExport
+                               ? (String(get(row, 'id') || '').trim() || `${docNr}-${itemNr}`)
+                               : `${docNr}-${itemNr}`,
+                docNr,
+                clientCode:    String(get(row, 'clientCode')    ?? '').trim(),
+                clientName:    String(get(row, 'clientName')    ?? '').trim(),
+                comercial:     String(get(row, 'comercial')     ?? '').trim(),
+                issueDate:     parseExcelDate(get(row, 'issueDate')),
+                requestedDate: parseExcelDate(get(row, 'requestedDate')),
+                itemNr,
+                po:            String(get(row, 'po')            ?? '').trim(),
+                articleCode:   String(get(row, 'articleCode')   ?? '').trim(),
+                reference:     String(get(row, 'reference')     ?? '').trim(),
+                colorCode:     String(get(row, 'colorCode')     ?? '').trim(),
+                colorDesc:     String(get(row, 'colorDesc')     ?? '').trim(),
+                size:          '',  // campo removido do ERP; mantido no tipo para compatibilidade SQLite
+                family:        String(get(row, 'family')        ?? '').trim(),
+                sizeDesc:      String(get(row, 'sizeDesc')      ?? '').trim(),
+                ean:           String(get(row, 'ean')           ?? '').trim(),
+                qtyRequested:  parseNumber(get(row, 'qtyRequested')),
+                dataTec:       parseExcelDate(get(row, 'dataTec')),
+                felpoCruQty:   parseNumber(get(row, 'felpoCruQty')),
+                felpoCruDate:  parseExcelDate(get(row, 'felpoCruDate')),
+                tinturariaQty: parseNumber(get(row, 'tinturariaQty')),
+                tinturariaDate:parseExcelDate(get(row, 'tinturariaDate')),
+                confRoupoesQty:parseNumber(get(row, 'confRoupoesQty')),
+                confFelposQty: parseNumber(get(row, 'confFelposQty')),
+                confDate:      parseExcelDate(get(row, 'confDate')),
+                embAcabQty:    parseNumber(get(row, 'embAcabQty')),
+                armExpDate:    parseExcelDate(get(row, 'armExpDate')),
+                stockCxQty:    parseNumber(get(row, 'stockCxQty')),
+                dataEnt:       parseExcelDate(get(row, 'dataEnt')),
+                qtyBilled:     parseNumber(get(row, 'qtyBilled')),
+                qtyOpen:       parseNumber(get(row, 'qtyOpen')),
+                // Datas especiais: existem no ERP (colunas AC-AG) e no formato app
+                dataEspecial:  parseExcelDate(get(row, 'dataEspecial')),
+                dataPrinter:   parseExcelDate(get(row, 'dataPrinter')),
+                dataDebuxo:    parseExcelDate(get(row, 'dataDebuxo')),
+                dataAmostras:  parseExcelDate(get(row, 'dataAmostras')),
+                dataBordados:  parseExcelDate(get(row, 'dataBordados')),
+                // Campos exclusivos da app (apenas no formato app; padrões para ERP)
+                priority:      isAppExport ? (parseNumber(get(row, 'priority')) || 0) : 0,
+                isManual:      isAppExport ? parseBool(get(row, 'isManual')) : false,
+                sectorObservations: isAppExport
+                    ? parseJsonField(get(row, 'sectorObservations'), {})
+                    : {},
+                sectorPredictedDates: isAppExport ? (() => {
+                    const raw = parseJsonField(get(row, 'sectorPredictedDates'), {});
+                    const result: Record<string, Date | null> = {};
+                    Object.entries(raw).forEach(([k, v]) => {
+                        result[k] = v ? new Date(v as string) : null;
+                    });
+                    return result;
+                })() : {},
+                sectorStopReasons: isAppExport
+                    ? parseJsonField(get(row, 'sectorStopReasons'), {})
+                    : {},
+                isArchived:  isAppExport ? parseBool(get(row, 'isArchived')) : false,
+                archivedAt:  isAppExport ? parseExcelDate(get(row, 'archivedAt')) : null,
+                archivedBy:  isAppExport ? String(get(row, 'archivedBy') ?? '').trim() || undefined : undefined,
+                // Recuperar datas previstas pendentes (avisos de atraso por sector)
+                sectorPredictedDatesPending: isAppExport ? (() => {
+                    const raw = parseJsonField(get(row, 'sectorPredictedDatesPending'), {});
+                    const result: Record<string, boolean> = {};
+                    Object.entries(raw).forEach(([k, v]) => { result[k] = Boolean(v); });
+                    return result;
+                })() : {},
             };
             mappedOrders.push(order);
         }
         resolve({ orders: mappedOrders, headers: extractedHeaders });
-      } catch (err) { 
+      } catch (err) {
           console.error("Erro no processamento Excel:", err);
-          reject(new Error("Erro ao processar ficheiro Excel.")); 
+          reject(new Error("Erro ao processar ficheiro Excel."));
       }
     };
     reader.onerror = () => reject(new Error("Erro ao ler ficheiro."));
@@ -578,36 +719,48 @@ export const parseSQLiteFile = async (file: File): Promise<{ orders: Order[], he
         const orders: Order[] = values.map((row: any[]) => {
             const obj: any = {};
             columns.forEach((col, i) => obj[col] = row[i]);
-            const dateFields = [
+
+            // Hidratar todos os campos de data (timestamps INTEGER → Date)
+            const DATE_FIELDS = [
                 'issueDate', 'requestedDate', 'dataTec', 'felpoCruDate', 'tinturariaDate',
                 'confDate', 'armExpDate', 'dataEnt', 'dataEspecial', 'dataPrinter',
-                'dataDebuxo', 'dataAmostras', 'dataBordados'
+                'dataDebuxo', 'dataAmostras', 'dataBordados', 'archivedAt',
             ];
-            dateFields.forEach(field => { if (obj[field]) obj[field] = new Date(obj[field]); });
-            if (obj.sectorObservations) {
-                try { obj.sectorObservations = JSON.parse(obj.sectorObservations); } catch { obj.sectorObservations = {}; }
-            }
+            DATE_FIELDS.forEach(field => {
+                if (obj[field]) obj[field] = new Date(obj[field]);
+                else obj[field] = null;
+            });
+
+            // Hidratar campos JSON
+            ['sectorObservations', 'sectorStopReasons'].forEach(field => {
+                if (obj[field]) {
+                    try { obj[field] = JSON.parse(obj[field]); } catch { obj[field] = {}; }
+                } else { obj[field] = {}; }
+            });
             if (obj.sectorPredictedDates) {
-                try { 
+                try {
                     const parsed = JSON.parse(obj.sectorPredictedDates);
-                    // Convert string dates back to Date objects
                     Object.keys(parsed).forEach(k => {
                         if (parsed[k]) parsed[k] = new Date(parsed[k]);
                     });
                     obj.sectorPredictedDates = parsed;
                 } catch { obj.sectorPredictedDates = {}; }
-            }
-            if (obj.sectorStopReasons) {
-                try { obj.sectorStopReasons = JSON.parse(obj.sectorStopReasons); } catch { obj.sectorStopReasons = {}; }
-            }
-            if (!obj.priority) obj.priority = 0;
-            if (!obj.comercial) obj.comercial = '';
-            // Garantir que isManual seja boolean
-            obj.isManual = obj.isManual === 1 || obj.isManual === true || obj.isManual === '1';
-            // Garantir que isArchived seja boolean
+            } else { obj.sectorPredictedDates = {}; }
+
+            if (obj.sectorPredictedDatesPending) {
+                try { obj.sectorPredictedDatesPending = JSON.parse(obj.sectorPredictedDatesPending); }
+                catch { obj.sectorPredictedDatesPending = {}; }
+            } else { obj.sectorPredictedDatesPending = {}; }
+
+            // Normalizar campos boolean
+            obj.isManual   = obj.isManual  === 1 || obj.isManual  === true || obj.isManual  === '1';
             obj.isArchived = obj.isArchived === 1 || obj.isArchived === true || obj.isArchived === '1';
-            if (obj.archivedAt) obj.archivedAt = new Date(obj.archivedAt);
-            
+
+            // Valores por omissão para campos que possam estar ausentes em ficheiros antigos
+            if (!obj.priority)   obj.priority  = 0;
+            if (!obj.comercial)  obj.comercial  = '';
+            if (obj.size === undefined) obj.size = '';
+
             return obj as Order;
         });
         
@@ -627,75 +780,71 @@ export const exportOrdersToSQLite = async (orders: Order[], headers: Record<stri
   db.run("CREATE TABLE headers (key TEXT, value TEXT)");
   Object.entries(headers).forEach(([k, v]) => db.run("INSERT INTO headers VALUES (?, ?)", [k, v]));
 
-  const schema = `
+  // Schema idêntico à estrutura da app (nomes internos = nomes das colunas SQLite)
+  db.run(`
     CREATE TABLE orders (
-      id TEXT PRIMARY KEY, docNr TEXT, clientCode TEXT, clientName TEXT, comercial TEXT,
-      issueDate INTEGER, requestedDate INTEGER, itemNr INTEGER, po TEXT,
+      id TEXT PRIMARY KEY,
+      clientCode TEXT, docNr TEXT, clientName TEXT, issueDate INTEGER,
+      requestedDate INTEGER, itemNr INTEGER, po TEXT,
       articleCode TEXT, reference TEXT, colorCode TEXT, colorDesc TEXT,
-      size TEXT, family TEXT, sizeDesc TEXT, ean TEXT, qtyRequested REAL,
-      dataTec INTEGER, felpoCruQty REAL, felpoCruDate INTEGER,
+      comercial TEXT, family TEXT, sizeDesc TEXT, ean TEXT,
+      qtyRequested REAL, dataTec INTEGER,
+      felpoCruQty REAL, felpoCruDate INTEGER,
       tinturariaQty REAL, tinturariaDate INTEGER,
       confRoupoesQty REAL, confFelposQty REAL, confDate INTEGER,
       embAcabQty REAL, armExpDate INTEGER, stockCxQty REAL,
-      dataEnt INTEGER, qtyBilled REAL, qtyOpen REAL,
-      sectorObservations TEXT, sectorPredictedDates TEXT, priority INTEGER, isManual INTEGER, sectorStopReasons TEXT,
-      dataEspecial INTEGER, dataPrinter INTEGER, dataDebuxo INTEGER, dataAmostras INTEGER, dataBordados INTEGER,
-      isArchived INTEGER, archivedAt INTEGER, archivedBy TEXT
-    );
-  `;
-  db.run(schema);
+      dataEnt INTEGER, dataEspecial INTEGER, dataPrinter INTEGER,
+      dataDebuxo INTEGER, dataAmostras INTEGER, dataBordados INTEGER,
+      qtyBilled REAL, qtyOpen REAL,
+      priority INTEGER, isManual INTEGER,
+      sectorObservations TEXT, sectorPredictedDates TEXT, sectorStopReasons TEXT,
+      isArchived INTEGER, archivedAt INTEGER, archivedBy TEXT,
+      size TEXT
+    )
+  `);
 
   db.run("BEGIN TRANSACTION");
-  // 45 colunas no total
   const stmt = db.prepare(`
     INSERT INTO orders VALUES (
-      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-      ?, ?, ?, ?, ?
+      ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
     )
   `);
 
   orders.forEach(o => {
+      const ts = (d: Date | null | undefined) => (d && !isNaN(d.getTime())) ? d.getTime() : null;
       stmt.run([
-        o.id, o.docNr, o.clientCode, o.clientName, o.comercial,
-        o.issueDate ? o.issueDate.getTime() : null,
-        o.requestedDate ? o.requestedDate.getTime() : null,
-        o.itemNr, o.po, o.articleCode, o.reference, o.colorCode, o.colorDesc,
-        o.size, o.family, o.sizeDesc, o.ean, o.qtyRequested,
-        o.dataTec ? o.dataTec.getTime() : null,
-        o.felpoCruQty, o.felpoCruDate ? o.felpoCruDate.getTime() : null,
-        o.tinturariaQty, o.tinturariaDate ? o.tinturariaDate.getTime() : null,
-        o.confRoupoesQty, o.confFelposQty, o.confDate ? o.confDate.getTime() : null,
-        o.embAcabQty, o.armExpDate ? o.armExpDate.getTime() : null,
-        o.stockCxQty, o.dataEnt ? o.dataEnt.getTime() : null,
-        o.qtyBilled, o.qtyOpen, JSON.stringify(o.sectorObservations || {}),
-        JSON.stringify(o.sectorPredictedDates || {}),
+        o.id,
+        o.clientCode, o.docNr, o.clientName,
+        ts(o.issueDate), ts(o.requestedDate),
+        o.itemNr, o.po,
+        o.articleCode, o.reference, o.colorCode, o.colorDesc,
+        o.comercial, o.family, o.sizeDesc, o.ean,
+        o.qtyRequested, ts(o.dataTec),
+        o.felpoCruQty, ts(o.felpoCruDate),
+        o.tinturariaQty, ts(o.tinturariaDate),
+        o.confRoupoesQty, o.confFelposQty, ts(o.confDate),
+        o.embAcabQty, ts(o.armExpDate), o.stockCxQty,
+        ts(o.dataEnt), ts(o.dataEspecial), ts(o.dataPrinter),
+        ts(o.dataDebuxo), ts(o.dataAmostras), ts(o.dataBordados),
+        o.qtyBilled, o.qtyOpen,
         o.priority || 0,
         o.isManual ? 1 : 0,
-        JSON.stringify(o.sectorStopReasons || {}),
-        o.dataEspecial ? o.dataEspecial.getTime() : null,
-        o.dataPrinter ? o.dataPrinter.getTime() : null,
-        o.dataDebuxo ? o.dataDebuxo.getTime() : null,
-        o.dataAmostras ? o.dataAmostras.getTime() : null,
-        o.dataBordados ? o.dataBordados.getTime() : null,
+        JSON.stringify(o.sectorObservations  || {}),
+        JSON.stringify(o.sectorPredictedDates || {}),
+        JSON.stringify(o.sectorStopReasons   || {}),
         o.isArchived ? 1 : 0,
-        o.archivedAt ? o.archivedAt.getTime() : null,
-        o.archivedBy || null
+        ts(o.archivedAt),
+        o.archivedBy || null,
+        o.size || '',
       ]);
   });
-  
+
   stmt.free();
   db.run("COMMIT");
 
   const data = db.export();
-
-  // Construct Default Filename with DD-MM-YYYY
   const now = new Date();
-  const day = String(now.getDate()).padStart(2, '0');
-  const month = String(now.getMonth() + 1).padStart(2, '0');
-  const year = now.getFullYear();
-  const dateStr = `${day}-${month}-${year}`;
-
+  const dateStr = `${String(now.getDate()).padStart(2,'0')}-${String(now.getMonth()+1).padStart(2,'0')}-${now.getFullYear()}`;
   const fileName = customFileName || `TexFlow_DB_${dateStr}.sqlite`;
 
   if (directoryHandle) {
@@ -706,7 +855,7 @@ export const exportOrdersToSQLite = async (orders: Order[], headers: Record<stri
         const writable = await fileHandle.createWritable();
         await writable.write(data);
         await writable.close();
-        return; 
+        return;
       }
     } catch (e) {
       console.error("Erro ao gravar na pasta configurada, usando fallback.", e);
@@ -724,152 +873,104 @@ export const exportOrdersToSQLite = async (orders: Order[], headers: Record<stri
 };
 
 // --- EXPORTAÇÃO PARA EXCEL ---
+//
+// Ficheiro único com UMA só folha ("Dados_BD"), completamente reimportável pela app.
+//
+// Estrutura das colunas (igual ao ERP + campos exclusivos da app a seguir):
+//   A=clientCode   B=docNr        C=clientName    D=issueDate      E=requestedDate
+//   F=itemNr       G=po           H=articleCode   I=reference      J=colorCode
+//   K=colorDesc    L=comercial    M=family        N=sizeDesc       O=ean
+//   P=qtyRequested Q=dataTec      R=felpoCruQty   S=felpoCruDate   T=tinturariaQty
+//   U=tinturariaDate V=confRoupoesQty W=confFelposQty X=confDate   Y=embAcabQty
+//   Z=armExpDate   AA=stockCxQty  AB=dataEnt      AC=dataEspecial  AD=dataPrinter
+//   AE=dataDebuxo  AF=dataAmostras AG=dataBordados AH=qtyBilled   AI=qtyOpen
+//   -- campos app --
+//   AJ=id  AK=priority  AL=isManual  AM=sectorObservations  AN=sectorPredictedDates
+//   AO=sectorPredictedDatesPending  AP=sectorStopReasons
+//   AQ=isArchived  AR=archivedAt  AS=archivedBy
+//
+// A 1ª linha contém os nomes internos dos campos (ex: "docNr", "qtyBilled").
+// Na reimportação, a presença de "docNr" como valor de cabeçalho identifica
+// este formato e activa a leitura por nome em vez de leitura posicional (ERP).
+//
 export const exportOrdersToExcel = (orders: Order[], headers: Record<string, string> = {}, customFileName?: string) => {
-    // Folha 1: Dados idênticos ao SQLite (para round-trip sem perda de informação)
-    const mainSheetData = orders.map(o => ({
-        // === IDENTIFICAÇÃO ===
-        'id': o.id,
-        'docNr': o.docNr,
-        'clientCode': o.clientCode,
-        'clientName': o.clientName,
-        'comercial': o.comercial,
-        'itemNr': o.itemNr,
-        'po': o.po,
-        // === ARTIGO ===
-        'articleCode': o.articleCode,
-        'reference': o.reference,
-        'colorCode': o.colorCode,
-        'colorDesc': o.colorDesc,
-        'size': o.size,
-        'family': o.family,
-        'sizeDesc': o.sizeDesc,
-        'ean': o.ean,
-        // === QUANTIDADES ===
-        'qtyRequested': o.qtyRequested,
-        'qtyBilled': o.qtyBilled,
-        'qtyOpen': o.qtyOpen,
-        // === DATAS PRINCIPAIS ===
-        'issueDate': o.issueDate ? formatDate(o.issueDate) : null,
-        'requestedDate': o.requestedDate ? formatDate(o.requestedDate) : null,
-        'dataEnt': o.dataEnt ? formatDate(o.dataEnt) : null,
-        'dataTec': o.dataTec ? formatDate(o.dataTec) : null,
-        'armExpDate': o.armExpDate ? formatDate(o.armExpDate) : null,
-        // === PRODUÇÃO - QUANTIDADES ===
-        'felpoCruQty': o.felpoCruQty,
-        'tinturariaQty': o.tinturariaQty,
-        'confRoupoesQty': o.confRoupoesQty,
-        'confFelposQty': o.confFelposQty,
-        'embAcabQty': o.embAcabQty,
-        'stockCxQty': o.stockCxQty,
-        // === PRODUÇÃO - DATAS ===
-        'felpoCruDate': o.felpoCruDate ? formatDate(o.felpoCruDate) : null,
-        'tinturariaDate': o.tinturariaDate ? formatDate(o.tinturariaDate) : null,
-        'confDate': o.confDate ? formatDate(o.confDate) : null,
-        // === DATAS ESPECIAIS ===
-        'dataEspecial': o.dataEspecial ? formatDate(o.dataEspecial) : null,
-        'dataPrinter': o.dataPrinter ? formatDate(o.dataPrinter) : null,
-        'dataDebuxo': o.dataDebuxo ? formatDate(o.dataDebuxo) : null,
-        'dataAmostras': o.dataAmostras ? formatDate(o.dataAmostras) : null,
-        'dataBordados': o.dataBordados ? formatDate(o.dataBordados) : null,
-        // === CAMPOS APLICAÇÃO ===
-        'priority': o.priority || 0,
-        'isManual': o.isManual ? 1 : 0,
-        'sectorObservations': JSON.stringify(o.sectorObservations || {}),
-        'sectorPredictedDates': JSON.stringify(o.sectorPredictedDates || {}),
-        'sectorStopReasons': JSON.stringify(o.sectorStopReasons || {}),
-        // === ARQUIVO ===
-        'isArchived': o.isArchived ? 1 : 0,
-        'archivedAt': o.archivedAt ? formatDate(o.archivedAt) : null,
-        'archivedBy': o.archivedBy || null,
-    }));
+    if (orders.length === 0) return;
 
-    // Folha 2: Vista legível para humanos
-    const readableSheetData = orders.map(o => {
-        const obsColumns: Record<string, string> = {};
-        const predictedDateColumns: Record<string, string> = {};
-        const stopReasonColumns: Record<string, string> = {};
-        ['tecelagem', 'felpo_cru', 'tinturaria', 'confeccao', 'embalagem', 'expedicao'].forEach(s => {
-            const label = s === 'felpo_cru' ? 'Felpo Cru' : s === 'confeccao' ? 'Confecção' : s === 'expedicao' ? 'Expedição' : s.charAt(0).toUpperCase() + s.slice(1);
-            obsColumns[`Obs. ${label}`] = o.sectorObservations?.[s] || '';
-            predictedDateColumns[`Prev. ${label}`] = formatDate(o.sectorPredictedDates?.[s]);
-            stopReasonColumns[`Motivo ${label}`] = o.sectorStopReasons?.[s] || '';
-        });
+    // Converte Date → string DD/MM/AAAA; null/inválido → '' (parseExcelDate trata '' como null)
+    const ts = (d: Date | null | undefined): string => {
+        if (!d || isNaN(d.getTime())) return '';
+        return formatDate(d);
+    };
 
-        return {
-            'Nr. Documento': o.docNr,
-            'Item': o.itemNr,
-            'Estado': getOrderState(o),
-            'Arquivado': o.isArchived ? 'Sim' : 'Não',
-            'Arquivado Em': o.archivedAt ? formatDate(o.archivedAt) : '',
-            'Arquivado Por': o.archivedBy || '',
-            'Prioridade': o.priority === 1 ? 'Alta' : o.priority === 2 ? 'Média' : o.priority === 3 ? 'Baixa' : '',
-            'Conf. Manual': o.isManual ? 'Sim' : 'Não',
-            'Cód. Cliente': o.clientCode,
-            'Cliente': o.clientName,
-            'Comercial': o.comercial,
-            'PO': o.po,
-            'Artigo': o.articleCode,
-            'Referência': o.reference,
-            'Cód. Cor': o.colorCode,
-            'Cor': o.colorDesc,
-            'Tamanho': o.size,
-            'Desc. Tamanho': o.sizeDesc,
-            'Família': o.family,
-            'EAN': o.ean,
-            'Qtd. Pedida': o.qtyRequested,
-            'Qtd. Faturada': o.qtyBilled,
-            'Qtd. Em Aberto': o.qtyOpen,
-            'Data Emissão': formatDate(o.issueDate),
-            'Data Entrega Pedida': formatDate(o.requestedDate),
-            'Data Entrada': formatDate(o.dataEnt),
-            'Data Prev. Armazém': formatDate(o.armExpDate),
-            'Data Tecelagem': formatDate(o.dataTec),
-            'Qtd. Felpo Cru': o.felpoCruQty,
-            'Data Felpo Cru': formatDate(o.felpoCruDate),
-            'Qtd. Tinturaria': o.tinturariaQty,
-            'Data Tinturaria': formatDate(o.tinturariaDate),
-            'Qtd. Conf. Roupões': o.confRoupoesQty,
-            'Qtd. Conf. Felpos': o.confFelposQty,
-            'Data Confecção': formatDate(o.confDate),
-            'Qtd. Embalagem': o.embAcabQty,
-            'Qtd. Stock Caixa': o.stockCxQty,
-            'Data Especial': formatDate(o.dataEspecial),
-            'Data Printer': formatDate(o.dataPrinter),
-            'Data Debuxo': formatDate(o.dataDebuxo),
-            'Data Amostras': formatDate(o.dataAmostras),
-            'Data Bordados': formatDate(o.dataBordados),
-            ...obsColumns,
-            ...predictedDateColumns,
-            ...stopReasonColumns,
-        };
+    // Serializa JSON de forma segura; null/undefined → '{}'
+    const j = (v: any): string => JSON.stringify(v || {});
+
+    const buildRow = (o: Order) => ({
+        // === Campos ERP (A–AI) — mesma ordem do ficheiro ERP ===
+        'clientCode':                   o.clientCode,           // A  Série
+        'docNr':                        o.docNr,                // B  Nr.Documento
+        'clientName':                   o.clientName,           // C  Cliente
+        'issueDate':                    ts(o.issueDate),        // D  Data Emissão
+        'requestedDate':                ts(o.requestedDate),    // E  Data Pedida
+        'itemNr':                       o.itemNr,               // F  Item
+        'po':                           o.po,                   // G  PO
+        'articleCode':                  o.articleCode,          // H  Cod.Artigo
+        'reference':                    o.reference,            // I  Referencia
+        'colorCode':                    o.colorCode,            // J  Cor
+        'colorDesc':                    o.colorDesc,            // K  Descricao (cor)
+        'comercial':                    o.comercial,            // L  Comercial
+        'family':                       o.family,               // M  Familia
+        'sizeDesc':                     o.sizeDesc,             // N  Descricao (tamanho)
+        'ean':                          o.ean,                  // O  EAN
+        'qtyRequested':                 o.qtyRequested,         // P  Qtd Pedida
+        'dataTec':                      ts(o.dataTec),          // Q  Data Tec.
+        'felpoCruQty':                  o.felpoCruQty,          // R  Felpo Cru
+        'felpoCruDate':                 ts(o.felpoCruDate),     // S  Data F.Cru
+        'tinturariaQty':                o.tinturariaQty,        // T  Tinturaria
+        'tinturariaDate':               ts(o.tinturariaDate),   // U  Data Tint.
+        'confRoupoesQty':               o.confRoupoesQty,       // V  Confeccao Roupoes
+        'confFelposQty':                o.confFelposQty,        // W  Confeccao Felpos
+        'confDate':                     ts(o.confDate),         // X  Data Conf.
+        'embAcabQty':                   o.embAcabQty,           // Y  Emb./Acab.
+        'armExpDate':                   ts(o.armExpDate),       // Z  Data Arm. Exp.
+        'stockCxQty':                   o.stockCxQty,           // AA Stock Cx.
+        'dataEnt':                      ts(o.dataEnt),          // AB Data Ent.
+        'dataEspecial':                 ts(o.dataEspecial),     // AC Data Especial.
+        'dataPrinter':                  ts(o.dataPrinter),      // AD Data Printer.
+        'dataDebuxo':                   ts(o.dataDebuxo),       // AE Data Debuxo.
+        'dataAmostras':                 ts(o.dataAmostras),     // AF Data Amostras.
+        'dataBordados':                 ts(o.dataBordados),     // AG Data Bordados.
+        'qtyBilled':                    o.qtyBilled,            // AH Facturada
+        'qtyOpen':                      o.qtyOpen,              // AI Em Aberto
+        // === Campos exclusivos da app (AJ–AS) ===
+        'id':                           o.id,                                   // AJ
+        'priority':                     o.priority || 0,                        // AK
+        'isManual':                     o.isManual ? 1 : 0,                     // AL
+        'sectorObservations':           j(o.sectorObservations),                // AM
+        'sectorPredictedDates':         j(o.sectorPredictedDates),              // AN
+        'sectorPredictedDatesPending':  j(o.sectorPredictedDatesPending),       // AO
+        'sectorStopReasons':            j(o.sectorStopReasons),                 // AP
+        'isArchived':                   o.isArchived ? 1 : 0,                   // AQ
+        'archivedAt':                   ts(o.archivedAt),                       // AR
+        'archivedBy':                   o.archivedBy || '',                     // AS
     });
 
-    // Folha 3: Headers mapeamento (equivalente à tabela headers do SQLite)
-    const headersSheetData = Object.entries(headers).map(([key, value]) => ({ Coluna: key, Cabeçalho: value }));
+    const sheetData = orders.map(buildRow);
 
     const workbook = XLSX.utils.book_new();
-
-    const wsMain = XLSX.utils.json_to_sheet(mainSheetData);
-    wsMain['!cols'] = Array(Object.keys(mainSheetData[0] || {}).length).fill({ wch: 18 });
-    XLSX.utils.book_append_sheet(workbook, wsMain, 'Dados_BD');
-
-    const wsReadable = XLSX.utils.json_to_sheet(readableSheetData);
-    wsReadable['!cols'] = Array(Object.keys(readableSheetData[0] || {}).length).fill({ wch: 20 });
-    XLSX.utils.book_append_sheet(workbook, wsReadable, 'Vista_Legível');
-
-    if (headersSheetData.length > 0) {
-        const wsHeaders = XLSX.utils.json_to_sheet(headersSheetData);
-        wsHeaders['!cols'] = [{ wch: 10 }, { wch: 40 }];
-        XLSX.utils.book_append_sheet(workbook, wsHeaders, 'Mapeamento_Colunas');
-    }
+    const ws = XLSX.utils.json_to_sheet(sheetData);
+    // Largura automática: datas=12, JSON=30, resto=18
+    const colWidths = Object.keys(sheetData[0]).map(k => {
+        if (k.startsWith('sector') || k === 'reference' || k === 'clientName') return { wch: 30 };
+        if (k.includes('Date') || k.includes('date') || k.includes('Date') || k === 'issueDate' || k === 'requestedDate' || k === 'dataEnt' || k === 'archivedAt') return { wch: 14 };
+        return { wch: 18 };
+    });
+    ws['!cols'] = colWidths;
+    XLSX.utils.book_append_sheet(workbook, ws, 'Dados_BD');
 
     const now = new Date();
-    const day = String(now.getDate()).padStart(2, '0');
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const year = now.getFullYear();
-    const dateStr = `${day}-${month}-${year}`;
-
-    const fileName = customFileName || `TexFlow_Export_Full_${dateStr}.xlsx`;
+    const dateStr = `${String(now.getDate()).padStart(2,'0')}-${String(now.getMonth()+1).padStart(2,'0')}-${now.getFullYear()}`;
+    const fileName = customFileName || `TexFlow_Export_${dateStr}.xlsx`;
     XLSX.writeFile(workbook, fileName);
 };
 
